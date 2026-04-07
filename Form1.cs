@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Windows.Forms;
 
 namespace PaintApp
@@ -66,6 +67,36 @@ namespace PaintApp
                     new Point(r.Left, r.Bottom),
                     new Point(r.Right, r.Bottom)
                 };
+            }
+
+            // ---- Serialization helpers ----
+            public string PenColorHex => ColorToHex(myPen.Color);
+            public float PenWidth => myPen.Width;
+            public int PenDash => (int)myPen.DashStyle;
+            public string BrushColorHex => myBrush is SolidBrush sb ? ColorToHex(sb.Color)
+                                         : myBrush is HatchBrush hb ? ColorToHex(hb.ForegroundColor) : "#0000FF";
+            public int BrushHatchStyle => myBrush is HatchBrush hb2 ? (int)hb2.HatchStyle : -1;
+
+            public static string ColorToHex(Color c) => $"#{c.R:X2}{c.G:X2}{c.B:X2}";
+            public static Color HexToColor(string hex)
+            {
+                hex = hex.TrimStart('#');
+                return Color.FromArgb(
+                    Convert.ToInt32(hex.Substring(0, 2), 16),
+                    Convert.ToInt32(hex.Substring(2, 2), 16),
+                    Convert.ToInt32(hex.Substring(4, 2), 16));
+            }
+
+            public void ApplySerializedPen(string colorHex, float width, int dash)
+            {
+                myPen = new Pen(HexToColor(colorHex), width) { DashStyle = (DashStyle)dash };
+            }
+            public void ApplySerializedBrush(string colorHex, int hatchStyle)
+            {
+                Color c = HexToColor(colorHex);
+                myBrush = hatchStyle < 0
+                    ? (Brush)new SolidBrush(c)
+                    : new HatchBrush((HatchStyle)hatchStyle, c, Color.Transparent);
             }
         }
 
@@ -247,16 +278,21 @@ namespace PaintApp
         Color brushColor = Color.LightBlue;
         float penWidth = 2f;
         DashStyle penDash = DashStyle.Solid;
+        int brushStyleIndex = -1;
 
         // Drag/select
         clsDrawObject dragObj = null;
         Point dragStart;
         Point dragObjOriginP1, dragObjOriginP2;
-        Point lastDragPos; // for group incremental move
+        Point lastDragPos;
 
         // Arc config
         float arcStart = 0f;
         float arcSweep = 180f;
+
+        // File management
+        string currentFilePath = null;
+        bool isDirty = false;
 
         // ============================================================
         //  CONSTRUCTOR
@@ -264,8 +300,17 @@ namespace PaintApp
         public Form1()
         {
             InitializeComponent();
+
+            this.DoubleBuffered = true;
+            typeof(Panel).InvokeMember("DoubleBuffered",
+                System.Reflection.BindingFlags.SetProperty |
+                System.Reflection.BindingFlags.Instance |
+                System.Reflection.BindingFlags.NonPublic,
+                null, plMain, new object[] { true });
+
             this.Text = "Paint Application - HCMUTE";
             UpdateColorPreviews();
+            UpdateTitle();
         }
 
         // ============================================================
@@ -277,12 +322,229 @@ namespace PaintApp
             p.DashStyle = penDash;
             return p;
         }
-        Brush MakeBrush() => new SolidBrush(brushColor);
+        Brush MakeBrush()
+        {
+            if (brushStyleIndex < 0)
+                return new SolidBrush(brushColor);
+
+            System.Drawing.Drawing2D.HatchStyle[] styles = new System.Drawing.Drawing2D.HatchStyle[]
+            {
+                System.Drawing.Drawing2D.HatchStyle.Horizontal,
+                System.Drawing.Drawing2D.HatchStyle.Vertical,
+                System.Drawing.Drawing2D.HatchStyle.ForwardDiagonal,
+                System.Drawing.Drawing2D.HatchStyle.BackwardDiagonal,
+                System.Drawing.Drawing2D.HatchStyle.Cross,
+                System.Drawing.Drawing2D.HatchStyle.DiagonalCross,
+                System.Drawing.Drawing2D.HatchStyle.LightUpwardDiagonal,
+                System.Drawing.Drawing2D.HatchStyle.DottedGrid,
+                System.Drawing.Drawing2D.HatchStyle.Shingle
+            };
+            return new System.Drawing.Drawing2D.HatchBrush(styles[brushStyleIndex], brushColor, Color.Transparent);
+        }
 
         void UpdateColorPreviews()
         {
             if (panelPenColor != null) panelPenColor.BackColor = penColor;
             if (panelBrushColor != null) panelBrushColor.BackColor = brushColor;
+        }
+
+        void UpdateTitle()
+        {
+            string fileName = currentFilePath != null ? Path.GetFileName(currentFilePath) : "Untitled";
+            string dirty = isDirty ? " *" : "";
+            this.Text = $"Paint Application - HCMUTE  [{fileName}{dirty}]";
+        }
+
+        void MarkDirty()
+        {
+            isDirty = true;
+            UpdateTitle();
+        }
+
+        // ============================================================
+        //  FILE OPERATIONS
+        // ============================================================
+
+        bool PromptSaveIfDirty()
+        {
+            if (!isDirty) return true;
+            string fileName = currentFilePath != null ? Path.GetFileName(currentFilePath) : "Untitled";
+            var result = MessageBox.Show(
+                $"File \"{fileName}\" có thay đổi chưa được lưu. Bạn có muốn lưu không?",
+                "Lưu thay đổi",
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Warning);
+
+            if (result == DialogResult.Yes) { SaveFile(); return true; }
+            if (result == DialogResult.No) return true;
+            return false; // Cancel
+        }
+
+        void NewFile()
+        {
+            if (!PromptSaveIfDirty()) return;
+            lstObject.Clear();
+            currentFilePath = null;
+            isDirty = false;
+            UpdateTitle();
+            plMain.Refresh();
+        }
+
+        void SaveFile()
+        {
+            if (currentFilePath == null)
+                SaveFileAs();
+            else
+                WriteFile(currentFilePath);
+        }
+
+        void SaveFileAs()
+        {
+            using (SaveFileDialog sfd = new SaveFileDialog())
+            {
+                sfd.Title = "Lưu file vẽ";
+                sfd.Filter = "Paint files (*.pnt)|*.pnt|All files (*.*)|*.*";
+                sfd.DefaultExt = "pnt";
+                if (sfd.ShowDialog() == DialogResult.OK)
+                {
+                    currentFilePath = sfd.FileName;
+                    WriteFile(currentFilePath);
+                }
+            }
+        }
+
+        void OpenFile()
+        {
+            if (!PromptSaveIfDirty()) return;
+            using (OpenFileDialog ofd = new OpenFileDialog())
+            {
+                ofd.Title = "Mở file vẽ";
+                ofd.Filter = "Paint files (*.pnt)|*.pnt|All files (*.*)|*.*";
+                if (ofd.ShowDialog() == DialogResult.OK)
+                    ReadFile(ofd.FileName);
+            }
+        }
+
+        void WriteFile(string path)
+        {
+            try
+            {
+                using (StreamWriter sw = new StreamWriter(path, false, System.Text.Encoding.UTF8))
+                    WriteObjects(sw, lstObject);
+                isDirty = false;
+                UpdateTitle();
+                MessageBox.Show("Lưu file thành công!", "Thành công", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Lỗi khi lưu file:\n{ex.Message}", "Lỗi", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        void WriteObjects(StreamWriter sw, List<clsDrawObject> objects)
+        {
+            sw.WriteLine(objects.Count);
+            foreach (var obj in objects)
+                WriteObject(sw, obj);
+        }
+
+        void WriteObject(StreamWriter sw, clsDrawObject obj)
+        {
+            sw.WriteLine(obj.GetType().Name);
+            sw.WriteLine($"{obj.p1.X},{obj.p1.Y}");
+            sw.WriteLine($"{obj.p2.X},{obj.p2.Y}");
+            sw.WriteLine(obj.PenColorHex);
+            sw.WriteLine(obj.PenWidth.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            sw.WriteLine(obj.PenDash);
+            sw.WriteLine(obj.BrushColorHex);
+            sw.WriteLine(obj.BrushHatchStyle);
+
+            if (obj is clsArc arc)
+            {
+                sw.WriteLine(arc.startAngle.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                sw.WriteLine(arc.sweepAngle.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            }
+            else if (obj is clsGroup grp)
+            {
+                WriteObjects(sw, grp.children);
+            }
+        }
+
+        void ReadFile(string path)
+        {
+            try
+            {
+                using (StreamReader sr = new StreamReader(path, System.Text.Encoding.UTF8))
+                {
+                    lstObject = ReadObjects(sr);
+                    currentFilePath = path;
+                    isDirty = false;
+                    UpdateTitle();
+                    plMain.Refresh();
+                }
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show($"Lỗi khi mở file:\n{ex.Message}", "Lỗi", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        List<clsDrawObject> ReadObjects(StreamReader sr)
+        {
+            int count = int.Parse(sr.ReadLine());
+            var list = new List<clsDrawObject>();
+            for (int i = 0; i < count; i++)
+                list.Add(ReadObject(sr));
+            return list;
+        }
+
+        clsDrawObject ReadObject(StreamReader sr)
+        {
+            string type = sr.ReadLine();
+            var p1Parts = sr.ReadLine().Split(',');
+            var p2Parts = sr.ReadLine().Split(',');
+            Point p1 = new Point(int.Parse(p1Parts[0]), int.Parse(p1Parts[1]));
+            Point p2 = new Point(int.Parse(p2Parts[0]), int.Parse(p2Parts[1]));
+            string penColorHex = sr.ReadLine();
+            float penW = float.Parse(sr.ReadLine(), System.Globalization.CultureInfo.InvariantCulture);
+            int penD = int.Parse(sr.ReadLine());
+            string brushColorHex = sr.ReadLine();
+            int brushH = int.Parse(sr.ReadLine());
+
+            clsDrawObject obj = CreateObjectByType(type);
+            obj.p1 = p1;
+            obj.p2 = p2;
+            obj.ApplySerializedPen(penColorHex, penW, penD);
+            obj.ApplySerializedBrush(brushColorHex, brushH);
+
+            if (obj is clsArc arc)
+            {
+                arc.startAngle = float.Parse(sr.ReadLine(), System.Globalization.CultureInfo.InvariantCulture);
+                arc.sweepAngle = float.Parse(sr.ReadLine(), System.Globalization.CultureInfo.InvariantCulture);
+            }
+            else if (obj is clsGroup grp)
+            {
+                grp.children = ReadObjects(sr);
+            }
+
+            return obj;
+        }
+
+        clsDrawObject CreateObjectByType(string type)
+        {
+            switch (type)
+            {
+                case "clsLine": return new clsLine();
+                case "clsEllipse": return new clsEllipse();
+                case "clsFilledEllipse": return new clsFilledEllipse();
+                case "clsRectangle": return new clsRectangle();
+                case "clsFilledRectangle": return new clsFilledRectangle();
+                case "clsCircle": return new clsCircle();
+                case "clsFilledCircle": return new clsFilledCircle();
+                case "clsArc": return new clsArc();
+                case "clsGroup": return new clsGroup();
+                default: throw new Exception($"Unknown object type: {type}");
+            }
         }
 
         // ============================================================
@@ -291,7 +553,6 @@ namespace PaintApp
         private void SetMode(DrawMode mode, Button activeBtn)
         {
             currentMode = mode;
-            // Highlight active button
             Button[] btns = { btnLine, btnEllipse, btnFilledEllipse, btnRect, btnFilledRect,
                               btnCircle, btnFilledCircle, btnArc, btnSelect };
             foreach (var b in btns)
@@ -307,6 +568,12 @@ namespace PaintApp
         private void btnFilledCircle_Click(object sender, EventArgs e) => SetMode(DrawMode.FilledCircle, btnFilledCircle);
         private void btnArc_Click(object sender, EventArgs e) => SetMode(DrawMode.Arc, btnArc);
         private void btnSelect_Click(object sender, EventArgs e) => SetMode(DrawMode.Select, btnSelect);
+
+        // File button handlers
+        private void btnNew_Click(object sender, EventArgs e) => NewFile();
+        private void btnSave_Click(object sender, EventArgs e) => SaveFile();
+        private void btnSaveAs_Click(object sender, EventArgs e) => SaveFileAs();
+        private void btnOpen_Click(object sender, EventArgs e) => OpenFile();
 
         private void btnPenColor_Click(object sender, EventArgs e)
         {
@@ -345,6 +612,11 @@ namespace PaintApp
             penDash = (DashStyle)cboDashStyle.SelectedIndex;
         }
 
+        private void cboBrushStyle_SelectedIndexChanged(object sender, EventArgs e)
+        {
+            brushStyleIndex = cboBrushStyle.SelectedIndex - 1;
+        }
+
         private void btnGroup_Click(object sender, EventArgs e)
         {
             var selected = lstObject.FindAll(o => o.isSelected && !(o is clsGroup));
@@ -358,6 +630,7 @@ namespace PaintApp
             }
             grp.isSelected = true;
             lstObject.Add(grp);
+            MarkDirty();
             plMain.Refresh();
         }
 
@@ -370,12 +643,14 @@ namespace PaintApp
                     lstObject.Add(child);
                 lstObject.Remove(grp);
             }
+            MarkDirty();
             plMain.Refresh();
         }
 
         private void btnDelete_Click(object sender, EventArgs e)
         {
             lstObject.RemoveAll(o => o.isSelected);
+            MarkDirty();
             plMain.Refresh();
         }
 
@@ -384,6 +659,7 @@ namespace PaintApp
             if (MessageBox.Show("Xóa toàn bộ?", "Clear", MessageBoxButtons.YesNo) == DialogResult.Yes)
             {
                 lstObject.Clear();
+                MarkDirty();
                 plMain.Refresh();
             }
         }
@@ -419,17 +695,13 @@ namespace PaintApp
 
             if (currentMode == DrawMode.Select)
             {
-                // Check if clicking on existing object
                 dragObj = null;
                 for (int i = lstObject.Count - 1; i >= 0; i--)
                 {
                     if (lstObject[i].HitTest(e.Location))
                     {
-                        // Ctrl+Click = multi-select
                         if ((Control.ModifierKeys & Keys.Control) == 0)
-                        {
                             foreach (var o in lstObject) o.isSelected = false;
-                        }
                         lstObject[i].isSelected = !lstObject[i].isSelected;
                         if (lstObject[i].isSelected)
                         {
@@ -443,13 +715,11 @@ namespace PaintApp
                         return;
                     }
                 }
-                // Click on empty -> deselect all
                 foreach (var o in lstObject) o.isSelected = false;
                 plMain.Refresh();
                 return;
             }
 
-            // Drawing mode
             clsDrawObject obj = CreateObject();
             if (obj == null) return;
             obj.myPen = MakePen();
@@ -470,9 +740,7 @@ namespace PaintApp
                 int dy = e.Y - lastDragPos.Y;
                 lastDragPos = e.Location;
                 if (dragObj is clsGroup grp)
-                {
                     grp.Move(dx, dy);
-                }
                 else
                 {
                     dragObj.p1 = new Point(dragObj.p1.X + dx, dragObj.p1.Y + dy);
@@ -496,6 +764,7 @@ namespace PaintApp
             if (lstObject.Count > 0 && currentMode != DrawMode.Select && currentMode != DrawMode.None)
             {
                 lstObject[lstObject.Count - 1].p2 = e.Location;
+                MarkDirty();
                 plMain.Refresh();
             }
         }
@@ -521,6 +790,13 @@ namespace PaintApp
                 case DrawMode.Arc: return new clsArc();
                 default: return null;
             }
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            base.OnFormClosing(e);
+            if (!PromptSaveIfDirty())
+                e.Cancel = true;
         }
     }
 }
